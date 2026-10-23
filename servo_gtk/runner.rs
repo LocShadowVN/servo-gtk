@@ -877,10 +877,10 @@ pub fn run() {
                     let pt = Point2D::new(button_press.x as f32, button_press.y as f32);
                     last_mouse_pos = pt;
                     let mouse_button = match button_press.button {
-                        1 => MouseButton::Left,
-                        2 => MouseButton::Middle,
-                        3 => MouseButton::Right,
-                        _ => MouseButton::Left,
+                        1 => MouseButton::Primary,
+                        2 => MouseButton::Auxiliary,
+                        3 => MouseButton::Secondary,
+                        _ => MouseButton::Primary,
                     };
                     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Down,
@@ -892,10 +892,10 @@ pub fn run() {
                     let pt = Point2D::new(button_release.x as f32, button_release.y as f32);
                     last_mouse_pos = pt;
                     let mouse_button = match button_release.button {
-                        1 => MouseButton::Left,
-                        2 => MouseButton::Middle,
-                        3 => MouseButton::Right,
-                        _ => MouseButton::Left,
+                        1 => MouseButton::Primary,
+                        2 => MouseButton::Auxiliary,
+                        3 => MouseButton::Secondary,
+                        _ => MouseButton::Primary,
                     };
                     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Up,
