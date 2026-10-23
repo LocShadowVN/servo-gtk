@@ -55,14 +55,6 @@ impl AdblockState {
     }
 
     /// Load a pre-serialized engine blob. Replaces any existing engine.
-    ///
-    /// This is the fast path: the UI builds the blob once from rules,
-    /// caches it on disk, and sends it here for each new tab. Deserialization
-    /// takes ~200ms, versus 5-15s to parse 180k raw rules.
-    ///
-    /// The blob must have been produced by the same `adblock` crate version
-    /// (`serialize_raw()`); a version mismatch produces a
-    /// `DeserializationError::UnsupportedFormatVersion` or a decode error.
     pub fn load_blob(&mut self, blob: &[u8]) -> Result<(), String> {
         if blob.is_empty() {
             self.engine = None;
@@ -97,9 +89,12 @@ impl AdblockState {
         let Some(engine) = &self.engine else {
             return false;
         };
-        let source = source_url.unwrap_or("");
-        // adblock-rust 0.9.x returns `Result<Request, RequestError>` from
-        // `Request::new`. A malformed request is treated as "not blocked".
+        // `adblock::request::Request::new` requires a valid URL with scheme/host
+        // for `source_url`; passing `""` fails URL parsing and skips blocking.
+        let source = source_url
+            .map(str::trim)
+            .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
+            .unwrap_or(url);
         let Ok(request) = Request::new(url, source, resource_type) else {
             return false;
         };
@@ -125,7 +120,7 @@ pub fn destination_to_resource_type(destination: &str) -> &'static str {
         "Media" | "Audio" | "Video" => "media",
         "Object" | "Embed" => "object",
         "Frame" | "Iframe" => "subdocument",
-        "Xhr" => "xmlhttprequest",
+        "Xhr" | "XmlHttpRequest" => "xmlhttprequest",
         "Fetch" => "fetch",
         "WebSocket" => "websocket",
         "Ping" => "ping",
@@ -138,6 +133,22 @@ pub fn destination_to_resource_type(destination: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standard_level_blocks_matching_requests() {
+        let mut state = AdblockState::new();
+        state.load_rules(&[
+            "||ads.example.com^".to_string(),
+            "||tracker.example.org^$third-party".to_string(),
+        ]);
+        state.set_level(LEVEL_STANDARD);
+        assert!(state.check("https://ads.example.com/banner.png", None, "image"));
+        assert!(state.check(
+            "https://tracker.example.org/pixel.js",
+            Some("https://vnexpress.net/"),
+            "script"
+        ));
+    }
 
     #[test]
     fn off_level_never_blocks() {
