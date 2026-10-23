@@ -9,6 +9,11 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::rc::Rc;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
 
 use core::time::Duration;
 use dpi::PhysicalSize;
@@ -18,12 +23,11 @@ use http::{HeaderMap, StatusCode};
 use keyboard_types::{Code, Key, KeyState, Location, Modifiers, NamedKey};
 use prost::Message;
 
-use servo::LoadStatus;
 use servo::user_contents::UserStyleSheet;
 use servo::{
     AuthenticationRequest, CreateNewWebViewRequest, PermissionRequest as ServoPermissionRequest,
 };
-use servo::{ConsoleLogLevel, UserContentManager, UserScript};
+use servo::{ConsoleLogLevel, EventLoopWaker, LoadStatus, UserContentManager, UserScript};
 use servo::{ContextMenu, EmbedderControl, FilePicker, SimpleDialog};
 use servo::{
     DeviceIntRect, DeviceVector2D, InputEvent, KeyboardEvent, MouseButton, MouseButtonAction,
@@ -33,17 +37,13 @@ use servo::{
     RenderingContext, SoftwareRenderingContext, WebResourceLoad, WebResourceResponse, WebView,
     WebViewBuilder, WebViewDelegate,
 };
-use std::str::FromStr;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
-use std::thread;
 use url::Url;
 
 use crate::adblock::{AdblockState, destination_to_resource_type};
 use crate::proto_ipc::{
-    CursorChanged, FileChooserRequest, FrameReady, LoadEnd, LoadStart, LogLevel, LogMessage,
-    PingRequest, ScriptDialogKind, ScriptDialogRequest, ScriptMessage, ServoAction, ServoEvent,
-    TitleChanged, UrlChanged, servo_action, servo_event,
+    AdblockBlocked, CursorChanged, FileChooserRequest, FrameReady, LoadEnd, LoadStart, LogLevel,
+    LogMessage, PingRequest, ScriptDialogKind, ScriptDialogRequest, ScriptMessage, ServoAction,
+    ServoEvent, TitleChanged, UrlChanged, servo_action, servo_event,
 };
 
 pub(crate) const SCRIPT_MESSAGE_PREFIX: &str = "__servo_gtk_msg__";
@@ -58,6 +58,29 @@ pub fn run_if_requested() {
     if is_runner {
         run();
         std::process::exit(0);
+    }
+}
+
+enum RunnerSignal {
+    Action(ServoAction),
+    Wake,
+}
+
+#[derive(Clone)]
+struct ChannelEventLoopWaker {
+    sender: Sender<RunnerSignal>,
+    woken: Arc<AtomicBool>,
+}
+
+impl EventLoopWaker for ChannelEventLoopWaker {
+    fn clone_box(&self) -> Box<dyn EventLoopWaker> {
+        Box::new(self.clone())
+    }
+
+    fn wake(&self) {
+        if !self.woken.swap(true, Ordering::AcqRel) {
+            let _ = self.sender.send(RunnerSignal::Wake);
+        }
     }
 }
 
@@ -192,13 +215,13 @@ impl ServoWebViewDelegate {
 }
 
 impl WebViewDelegate for ServoWebViewDelegate {
-    fn load_web_resource(&self, _webview: WebView, load: WebResourceLoad) {
+    fn load_web_resource(&self, webview: WebView, load: WebResourceLoad) {
         if load.request.is_for_main_frame {
             return;
         }
 
         let dest_debug = format!("{:?}", load.request.destination);
-        if dest_debug == "Document" || dest_debug == "Frame" || dest_debug == "Iframe" {
+        if dest_debug == "Document" {
             return;
         }
 
@@ -207,7 +230,8 @@ impl WebViewDelegate for ServoWebViewDelegate {
             .request
             .referrer_url
             .as_ref()
-            .map(|u| u.as_str().to_string());
+            .map(|u| u.as_str().to_string())
+            .or_else(|| webview.url().map(|u| u.to_string()));
         let resource_type = destination_to_resource_type(&dest_debug);
 
         if self
@@ -216,6 +240,14 @@ impl WebViewDelegate for ServoWebViewDelegate {
             .check(&url, source_url.as_deref(), resource_type)
         {
             log::debug!("[adblock] Blocked: {} ({})", url, resource_type);
+
+            let event = ServoEvent {
+                event: Some(servo_event::Event::AdblockBlocked(AdblockBlocked {
+                    url,
+                    resource_type: resource_type.to_string(),
+                })),
+            };
+            let _ = self.event_pipe.send(event);
 
             let response = WebResourceResponse {
                 url: load.request.url.clone(),
@@ -508,8 +540,7 @@ fn init_crypto() {
         .expect("Error initializing crypto provider");
 }
 
-fn spawn_stdin_channel() -> Receiver<ServoAction> {
-    let (tx, rx) = mpsc::channel::<ServoAction>();
+fn spawn_stdin_channel(tx: Sender<RunnerSignal>) {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         loop {
@@ -525,13 +556,12 @@ fn spawn_stdin_channel() -> Receiver<ServoAction> {
             }
 
             if let Ok(action) = ServoAction::decode_from_slice(&msg_buf)
-                && tx.send(action).is_err()
+                && tx.send(RunnerSignal::Action(action)).is_err()
             {
                 break;
             }
         }
     });
-    rx
 }
 
 fn convert_location(proto_location: crate::proto_ipc::Location) -> Location {
@@ -659,8 +689,6 @@ impl<T> PendingRequests<T> {
         self.pending.remove(&id)
     }
 
-    /// Test-only helper. `#[allow(dead_code)]` silences `-D warnings` in
-    /// non-test builds where this method has no caller.
     #[allow(dead_code)]
     fn len(&self) -> usize {
         self.pending.len()
@@ -698,6 +726,11 @@ fn push_coalesced_input(pending: &mut Vec<servo_action::Action>, action: ServoAc
             last.dy += new.dy;
             return;
         }
+        (Some(servo_action::Action::Resize(last)), servo_action::Action::Resize(new)) => {
+            last.width = new.width;
+            last.height = new.height;
+            return;
+        }
         _ => {}
     }
 
@@ -705,7 +738,7 @@ fn push_coalesced_input(pending: &mut Vec<servo_action::Action>, action: ServoAc
 }
 
 pub fn run() {
-    const SPIN_INTERVAL: Duration = Duration::from_millis(5);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
     let (event_logger, log_receiver) = EventLogger::new();
 
@@ -716,9 +749,13 @@ pub fn run() {
 
     log::info!("Starting servo runner");
 
-    let size = PhysicalSize::new(800, 600);
+    let mut current_size = PhysicalSize::new(800, 600);
+    let mut current_scale: f32 = 1.0;
+    let mut last_mouse_pos: Point2D<f32, embedder_traits::DevicePixel> = Point2D::new(400.0, 300.0);
+
     let rendering_context = Rc::new(
-        SoftwareRenderingContext::new(size).expect("Failed to create Software rendering context"),
+        SoftwareRenderingContext::new(current_size)
+            .expect("Failed to create Software rendering context"),
     );
 
     let config_dir = glib::user_config_dir().join("servo-gtk");
@@ -731,11 +768,19 @@ pub fn run() {
         ..Default::default()
     };
 
-    // Servo requires a resource reader before the constellation starts. Ensure
-    // ours is registered (and its GResource bundle available) first.
     crate::resource_reader::ensure_registered();
 
-    let servo_builder = ServoBuilder::default().opts(opts);
+    let (signal_tx, receiver): (Sender<RunnerSignal>, Receiver<RunnerSignal>) = mpsc::channel();
+    let woken = Arc::new(AtomicBool::new(false));
+    let waker = ChannelEventLoopWaker {
+        sender: signal_tx.clone(),
+        woken: woken.clone(),
+    };
+    spawn_stdin_channel(signal_tx);
+
+    let servo_builder = ServoBuilder::default()
+        .opts(opts)
+        .event_loop_waker(Box::new(waker));
     let servo = servo_builder.build();
 
     let user_content_manager = Rc::new(UserContentManager::new(&servo));
@@ -752,7 +797,7 @@ pub fn run() {
         popups.clone(),
     ));
 
-    let webview = WebViewBuilder::new(&servo, rendering_context)
+    let webview = WebViewBuilder::new(&servo, rendering_context.clone())
         .delegate(delegate)
         .user_content_manager(user_content_manager.clone())
         .build();
@@ -760,8 +805,6 @@ pub fn run() {
     let mut user_scripts: Vec<Rc<UserScript>> = Vec::new();
     let mut user_style_sheets: Vec<Rc<UserStyleSheet>> = Vec::new();
     let mut pending_pings: PendingRequests<()> = PendingRequests::new();
-
-    let receiver = spawn_stdin_channel();
 
     'event_loop: loop {
         while let Ok(log_message) = log_receiver.try_recv() {
@@ -772,14 +815,18 @@ pub fn run() {
         }
 
         let mut pending = Vec::new();
-        match receiver.recv_timeout(SPIN_INTERVAL) {
-            Ok(action) => push_coalesced_input(&mut pending, action),
+        match receiver.recv_timeout(IDLE_POLL_INTERVAL) {
+            Ok(RunnerSignal::Action(action)) => push_coalesced_input(&mut pending, action),
+            Ok(RunnerSignal::Wake) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        while let Ok(action) = receiver.try_recv() {
-            push_coalesced_input(&mut pending, action);
+        while let Ok(sig) = receiver.try_recv() {
+            if let RunnerSignal::Action(action) = sig {
+                push_coalesced_input(&mut pending, action);
+            }
         }
+        woken.store(false, Ordering::Release);
 
         for action_type in pending {
             match action_type {
@@ -811,22 +858,24 @@ pub fn run() {
                     let _ = webview.go_forward(1);
                 }
                 servo_action::Action::Resize(resize) => {
-                    log::debug!("Resizing to {}x{}", resize.width, resize.height);
-                    webview.resize(PhysicalSize::new(resize.width.max(1), resize.height.max(1)));
+                    let new_size = PhysicalSize::new(resize.width.max(1), resize.height.max(1));
+                    if new_size != current_size {
+                        current_size = new_size;
+                        log::debug!("Resizing to {}x{}", new_size.width, new_size.height);
+                        rendering_context.resize(new_size);
+                        webview.resize(new_size);
+                    }
                 }
                 servo_action::Action::Motion(motion) => {
-                    log::debug!("Mouse motion: ({}, {})", motion.x, motion.y);
+                    let pt = Point2D::new(motion.x as f32, motion.y as f32);
+                    last_mouse_pos = pt;
                     webview.notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(
-                        WebViewPoint::Device(Point2D::new(motion.x as f32, motion.y as f32)),
+                        WebViewPoint::Device(pt),
                     )));
                 }
                 servo_action::Action::ButtonPress(button_press) => {
-                    log::debug!(
-                        "Button press: button {} at ({}, {})",
-                        button_press.button,
-                        button_press.x,
-                        button_press.y
-                    );
+                    let pt = Point2D::new(button_press.x as f32, button_press.y as f32);
+                    last_mouse_pos = pt;
                     let mouse_button = match button_press.button {
                         1 => MouseButton::Left,
                         2 => MouseButton::Middle,
@@ -836,19 +885,12 @@ pub fn run() {
                     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Down,
                         mouse_button,
-                        WebViewPoint::Device(Point2D::new(
-                            button_press.x as f32,
-                            button_press.y as f32,
-                        )),
+                        WebViewPoint::Device(pt),
                     )));
                 }
                 servo_action::Action::ButtonRelease(button_release) => {
-                    log::debug!(
-                        "Button release: button {} at ({}, {})",
-                        button_release.button,
-                        button_release.x,
-                        button_release.y
-                    );
+                    let pt = Point2D::new(button_release.x as f32, button_release.y as f32);
+                    last_mouse_pos = pt;
                     let mouse_button = match button_release.button {
                         1 => MouseButton::Left,
                         2 => MouseButton::Middle,
@@ -858,14 +900,10 @@ pub fn run() {
                     webview.notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                         MouseButtonAction::Up,
                         mouse_button,
-                        WebViewPoint::Device(Point2D::new(
-                            button_release.x as f32,
-                            button_release.y as f32,
-                        )),
+                        WebViewPoint::Device(pt),
                     )));
                 }
                 servo_action::Action::KeyPress(key_press) => {
-                    log::debug!("Key press: {}", key_press.key);
                     let key_event = convert_key_event(
                         key_press.key,
                         key_press.key_type,
@@ -877,7 +915,6 @@ pub fn run() {
                     webview.notify_input_event(InputEvent::Keyboard(key_event));
                 }
                 servo_action::Action::KeyRelease(key_release) => {
-                    log::debug!("Key release: {}", key_release.key);
                     let key_event = convert_key_event(
                         key_release.key,
                         key_release.key_type,
@@ -889,7 +926,6 @@ pub fn run() {
                     webview.notify_input_event(InputEvent::Keyboard(key_event));
                 }
                 servo_action::Action::TouchBegin(touch_begin) => {
-                    log::debug!("Touch begin at ({}, {})", touch_begin.x, touch_begin.y);
                     webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
                         servo::TouchEventType::Down,
                         servo::TouchId(0),
@@ -901,7 +937,6 @@ pub fn run() {
                     )));
                 }
                 servo_action::Action::TouchUpdate(touch_update) => {
-                    log::debug!("Touch update at ({}, {})", touch_update.x, touch_update.y);
                     webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
                         servo::TouchEventType::Move,
                         servo::TouchId(0),
@@ -913,7 +948,6 @@ pub fn run() {
                     )));
                 }
                 servo_action::Action::TouchEnd(touch_end) => {
-                    log::debug!("Touch end at ({}, {})", touch_end.x, touch_end.y);
                     webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
                         servo::TouchEventType::Up,
                         servo::TouchId(0),
@@ -922,7 +956,6 @@ pub fn run() {
                     )));
                 }
                 servo_action::Action::TouchCancel(touch_cancel) => {
-                    log::debug!("Touch cancel at ({}, {})", touch_cancel.x, touch_cancel.y);
                     webview.notify_input_event(InputEvent::Touch(servo::TouchEvent::new(
                         servo::TouchEventType::Cancel,
                         servo::TouchId(0),
@@ -934,13 +967,12 @@ pub fn run() {
                     )));
                 }
                 servo_action::Action::Scroll(scroll) => {
-                    log::debug!("Scroll: dx={}, dy={}", scroll.dx, scroll.dy);
                     webview.notify_scroll_event(
                         Scroll::Delta(WebViewVector::Device(DeviceVector2D::new(
-                            20.0 * scroll.dx as f32,
-                            20.0 * scroll.dy as f32,
+                            48.0 * scroll.dx as f32,
+                            48.0 * scroll.dy as f32,
                         ))),
-                        WebViewPoint::Device(Point2D::new(10.0, 10.0)),
+                        WebViewPoint::Device(last_mouse_pos),
                     );
                 }
                 servo_action::Action::Shutdown(_) => {
@@ -948,19 +980,11 @@ pub fn run() {
                     break 'event_loop;
                 }
                 servo_action::Action::AddUserScript(add_user_script) => {
-                    log::info!(
-                        "Adding user script ({} bytes)",
-                        add_user_script.source.len()
-                    );
                     let script = Rc::new(UserScript::new(add_user_script.source, None));
                     user_content_manager.add_script(script.clone());
                     user_scripts.push(script);
                 }
                 servo_action::Action::AddUserStyleSheet(add_user_style_sheet) => {
-                    log::info!(
-                        "Adding user style sheet ({} bytes)",
-                        add_user_style_sheet.source.len()
-                    );
                     if let Ok(url) = Url::parse("about:user-stylesheet") {
                         let stylesheet =
                             Rc::new(UserStyleSheet::new(add_user_style_sheet.source, url));
@@ -969,19 +993,16 @@ pub fn run() {
                     }
                 }
                 servo_action::Action::RemoveAllUserScripts(_) => {
-                    log::info!("Removing all user scripts");
                     for script in user_scripts.drain(..) {
                         user_content_manager.remove_script(script);
                     }
                 }
                 servo_action::Action::RemoveAllUserStyleSheets(_) => {
-                    log::info!("Removing all user style sheets");
                     for stylesheet in user_style_sheets.drain(..) {
                         user_content_manager.remove_stylesheet(stylesheet);
                     }
                 }
                 servo_action::Action::RegisterScriptMessageHandler(register) => {
-                    log::info!("Registering script message handler: {}", register.name);
                     let shim = script_message_handler_shim(&register.name);
                     let script = Rc::new(UserScript::new(shim, None));
                     user_content_manager.add_script(script.clone());
@@ -991,18 +1012,19 @@ pub fn run() {
                     log::info!("Unregistering script message handler: {}", unregister.name);
                 }
                 servo_action::Action::EvaluateJavascript(evaluate) => {
-                    log::debug!("Evaluating JavaScript ({} bytes)", evaluate.source.len());
                     webview.evaluate_javascript(evaluate.source, |_result| {});
                 }
                 servo_action::Action::SetZoomLevel(set_zoom_level) => {
                     let zoom = clamp_zoom_level(set_zoom_level.level);
-                    log::debug!("Setting page zoom to {zoom}");
                     webview.set_page_zoom(zoom);
                 }
                 servo_action::Action::SetHidpiScaleFactor(set_hidpi) => {
                     let scale = set_hidpi.scale;
-                    if scale.is_finite() && scale > 0.0 {
-                        log::debug!("Setting HiDPI scale factor to {scale}");
+                    if scale.is_finite()
+                        && scale > 0.0
+                        && (scale - current_scale).abs() > f32::EPSILON
+                    {
+                        current_scale = scale;
                         webview.set_hidpi_scale_factor(Scale::new(scale));
                     }
                 }
@@ -1041,7 +1063,6 @@ pub fn run() {
                 }
                 servo_action::Action::Ping(_) => {
                     let request_id = pending_pings.insert(());
-                    log::debug!("Ping: emitting PingRequest id {request_id}");
                     let event = ServoEvent {
                         event: Some(servo_event::Event::PingRequest(PingRequest { request_id })),
                     };
