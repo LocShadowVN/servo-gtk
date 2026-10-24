@@ -751,7 +751,7 @@ pub fn run() {
 
     let mut current_size = PhysicalSize::new(800, 600);
     let mut current_scale: f32 = 1.0;
-    let mut last_mouse_pos: Point2D<f32, embedder_traits::DevicePixel> = Point2D::new(400.0, 300.0);
+    let mut last_mouse_pos = Point2D::new(400.0, 300.0);
 
     let rendering_context = Rc::new(
         SoftwareRenderingContext::new(current_size)
