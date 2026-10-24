@@ -27,7 +27,9 @@ use servo::user_contents::UserStyleSheet;
 use servo::{
     AuthenticationRequest, CreateNewWebViewRequest, PermissionRequest as ServoPermissionRequest,
 };
-use servo::{ConsoleLogLevel, EventLoopWaker, LoadStatus, UserContentManager, UserScript};
+use servo::{
+    ConsoleLogLevel, EventLoopWaker, LoadStatus, Preferences, UserContentManager, UserScript,
+};
 use servo::{ContextMenu, EmbedderControl, FilePicker, SimpleDialog};
 use servo::{
     DeviceIntRect, DeviceVector2D, InputEvent, KeyboardEvent, MouseButton, MouseButtonAction,
@@ -49,6 +51,8 @@ use crate::proto_ipc::{
 pub(crate) const SCRIPT_MESSAGE_PREFIX: &str = "__servo_gtk_msg__";
 
 pub const RUNNER_ARG: &str = "--servo-gtk-runner";
+
+const DEFAULT_CHROME_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
 pub fn run_if_requested() {
     let is_runner = std::env::args()
@@ -496,6 +500,7 @@ fn parse_script_message(message: &str) -> Option<ServoEvent> {
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
     let name = value.get("name")?.as_str()?.to_string();
     let body = match value.get("body") {
+        Some(serde_json::Value::String(s)) => s.clone(),
         Some(body) => body.to_string(),
         None => "null".to_string(),
     };
@@ -768,6 +773,13 @@ pub fn run() {
         ..Default::default()
     };
 
+    let mut preferences = Preferences::default();
+    let ua = std::env::var("KESTREL_USER_AGENT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CHROME_UA.to_string());
+    preferences.user_agent = ua;
+
     crate::resource_reader::ensure_registered();
 
     let (signal_tx, receiver): (Sender<RunnerSignal>, Receiver<RunnerSignal>) = mpsc::channel();
@@ -780,6 +792,7 @@ pub fn run() {
 
     let servo_builder = ServoBuilder::default()
         .opts(opts)
+        .preferences(preferences)
         .event_loop_waker(Box::new(waker));
     let servo = servo_builder.build();
 
