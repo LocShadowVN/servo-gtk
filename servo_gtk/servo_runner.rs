@@ -127,10 +127,7 @@ impl ServoRunner {
             .encode(&mut framed)
             .expect("encoding into a Vec cannot fail");
 
-        let sender = self.frame_sender.clone();
-        glib::spawn_future_local(async move {
-            let _ = sender.send(framed).await;
-        });
+        let _ = self.frame_sender.try_send(framed);
     }
 
     pub fn event_receiver(&self) -> async_channel::Receiver<ServoEvent> {
