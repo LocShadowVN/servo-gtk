@@ -10,9 +10,9 @@ use std::io::{self, Read, Write};
 use std::os::fd::BorrowedFd;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread;
 
 use core::time::Duration;
@@ -221,7 +221,7 @@ impl WebViewDelegate for ServoWebViewDelegate {
         }
 
         let dest_debug = format!("{:?}", load.request.destination);
-        if dest_debug == "Document" {
+        if dest_debug == "Document" || dest_debug == "Frame" || dest_debug == "Iframe" {
             return;
         }
 
@@ -797,7 +797,7 @@ pub fn run() {
         popups.clone(),
     ));
 
-    let webview = WebViewBuilder::new(&servo, rendering_context.clone())
+    let webview = WebViewBuilder::new(&servo, rendering_context)
         .delegate(delegate)
         .user_content_manager(user_content_manager.clone())
         .build();
@@ -862,7 +862,6 @@ pub fn run() {
                     if new_size != current_size {
                         current_size = new_size;
                         log::debug!("Resizing to {}x{}", new_size.width, new_size.height);
-                        rendering_context.resize(new_size);
                         webview.resize(new_size);
                     }
                 }
