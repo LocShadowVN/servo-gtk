@@ -15,7 +15,6 @@ use glib::translate::*;
 use gtk::gdk;
 use gtk::prelude::*;
 use gtk::{glib, subclass::prelude::*};
-use image::RgbaImage;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -44,6 +43,8 @@ mod imp {
         pub memory_texture: RefCell<Option<gdk::MemoryTexture>>,
         pub key_tables: KeyTables,
         pub user_content_manager: RefCell<Option<UserContentManager>>,
+        pub last_size: Cell<(u32, u32)>,
+        pub last_scale: Cell<f64>,
 
         #[property(get, name = "uri", nullable)]
         pub uri: RefCell<Option<String>>,
@@ -54,10 +55,7 @@ mod imp {
         #[property(get, set = Self::set_zoom_level, name = "zoom-level", minimum = 0.1, maximum = 10.0, default = 1.0)]
         pub zoom_level: Cell<f64>,
 
-        /// Counter for consecutive load-starts without a completed load. A
-        /// page that fires load-starts in a tight loop (e.g. because an ad
-        /// blocker cancelled a resource that page JS retries) is broken by
-        /// refusing to process further load-starts beyond a small threshold.
+        /// Counter for consecutive load-starts without a completed load.
         pub load_loop_guard: Cell<u32>,
     }
 
@@ -74,6 +72,22 @@ mod imp {
             self.zoom_level.set(clamped);
             if let Some(servo) = self.servo_runner.borrow().as_ref() {
                 servo.set_zoom_level(clamped);
+            }
+        }
+
+        pub(super) fn sync_geometry(&self, width: f64, height: f64, scale: f64) {
+            let Some(servo) = self.servo_runner.borrow().as_ref().cloned() else {
+                return;
+            };
+            if (scale - self.last_scale.get()).abs() > f64::EPSILON {
+                self.last_scale.set(scale);
+                servo.set_hidpi_scale_factor(scale as f32);
+            }
+            let dev_w = (width.max(0.0) * scale).round() as u32;
+            let dev_h = (height.max(0.0) * scale).round() as u32;
+            if dev_w > 0 && dev_h > 0 && self.last_size.get() != (dev_w, dev_h) {
+                self.last_size.set((dev_w, dev_h));
+                servo.resize(dev_w, dev_h);
             }
         }
     }
@@ -101,6 +115,7 @@ mod imp {
             self.parent_constructed();
 
             self.zoom_level.set(1.0);
+            self.last_scale.set(1.0);
 
             let servo_runner = ServoRunner::new();
             let event_receiver = servo_runner.event_receiver();
@@ -186,7 +201,6 @@ mod imp {
                         && let Some((key, is_character, location)) =
                             imp.key_tables.key_from_keyval(keyval.into_glib())
                     {
-                        info!("Pressed key {key:?} at location {location:?}");
                         servo.key_press(key, is_character, location, keycode, state.bits());
                     }
                 }
@@ -225,17 +239,10 @@ mod imp {
             self.obj().add_controller(scroll_controller);
 
             fn resync_surface(obj: &super::WebView) {
-                let imp = obj.imp();
-                if let Some(servo) = imp.servo_runner.borrow().as_ref() {
-                    let scale = obj.device_scale();
-                    let width = gtk::prelude::WidgetExt::width(obj) as f64;
-                    let height = gtk::prelude::WidgetExt::height(obj) as f64;
-                    servo.set_hidpi_scale_factor(scale as f32);
-                    servo.resize(
-                        (width * scale).round() as u32,
-                        (height * scale).round() as u32,
-                    );
-                }
+                let scale = obj.device_scale();
+                let width = gtk::prelude::WidgetExt::width(obj) as f64;
+                let height = gtk::prelude::WidgetExt::height(obj) as f64;
+                obj.imp().sync_geometry(width, height, scale);
             }
 
             self.obj().connect_scale_factor_notify(resync_surface);
@@ -279,14 +286,8 @@ mod imp {
         }
 
         fn size_allocate(&self, width: i32, height: i32, _baseline: i32) {
-            if let Some(servo) = self.servo_runner.borrow().as_ref() {
-                let scale = self.obj().device_scale();
-                servo.set_hidpi_scale_factor(scale as f32);
-                servo.resize(
-                    ((width.max(0) as f64) * scale).round() as u32,
-                    ((height.max(0) as f64) * scale).round() as u32,
-                );
-            }
+            let scale = self.obj().device_scale();
+            self.sync_geometry(width as f64, height as f64, scale);
         }
     }
 }
@@ -361,12 +362,6 @@ impl WebView {
         }
     }
 
-    /// Gửi blob adblock đã serialize xuống runner subprocess.
-    ///
-    /// Blob là kết quả của `adblock::Engine::serialize_raw()` (xem Kestrel
-    /// `adblock_rules` module). Cách này nhanh hơn `update_adblock_rules()`
-    /// vì runner chỉ cần deserialize (~200ms) thay vì parse 180k rules
-    /// (~5-15s).
     pub fn set_adblock_blob(&self, blob: Vec<u8>) {
         let imp = self.imp();
         if let Some(servo) = imp.servo_runner.borrow().as_ref() {
@@ -850,25 +845,25 @@ impl WebView {
 
         match event_type {
             servo_event::Event::FrameReady(frame_ready) => {
-                let rgba_image = RgbaImage::from_raw(
-                    frame_ready.width,
-                    frame_ready.height,
-                    frame_ready.rgba_data,
-                )
-                .unwrap();
+                let width = frame_ready.width;
+                let height = frame_ready.height;
+                let expected_len = (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(4);
+                if width == 0 || height == 0 || frame_ready.rgba_data.len() != expected_len {
+                    return;
+                }
 
-                let imp = self.imp();
-
-                let bytes = glib::Bytes::from(&rgba_image.as_raw()[..]);
+                let bytes = glib::Bytes::from_owned(frame_ready.rgba_data);
                 let texture = gdk::MemoryTexture::new(
-                    rgba_image.width() as i32,
-                    rgba_image.height() as i32,
+                    width as i32,
+                    height as i32,
                     gdk::MemoryFormat::R8g8b8a8,
                     &bytes,
-                    (rgba_image.width() * 4) as usize,
+                    (width * 4) as usize,
                 );
 
-                imp.memory_texture.replace(Some(texture));
+                self.imp().memory_texture.replace(Some(texture));
                 self.queue_draw();
             }
             servo_event::Event::CursorChanged(cursor_changed) => {
