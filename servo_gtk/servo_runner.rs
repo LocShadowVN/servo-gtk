@@ -9,6 +9,7 @@ use gio::{Subprocess, SubprocessFlags, SubprocessLauncher};
 use glib::{debug, error, info, warn};
 use prost::Message;
 use std::ffi::OsStr;
+use std::time::Duration;
 
 use crate::proto_ipc::{ServoAction, ServoEvent, servo_action};
 
@@ -37,7 +38,7 @@ impl From<i32> for LogLevel {
 pub struct ServoRunner {
     frame_sender: async_channel::Sender<Vec<u8>>,
     event_receiver: async_channel::Receiver<ServoEvent>,
-    _subprocess: Subprocess,
+    subprocess: Subprocess,
 }
 
 #[allow(clippy::new_without_default)]
@@ -73,6 +74,7 @@ impl ServoRunner {
                         break;
                     }
                 }
+                let _ = stdin.close_future(glib::Priority::DEFAULT).await;
             }
         ));
 
@@ -80,13 +82,14 @@ impl ServoRunner {
             #[strong]
             stdout,
             async move {
+                let mut len_buf = vec![0u8; 4];
                 loop {
-                    let len_buf = vec![0u8; 4];
                     match stdout
                         .read_all_future(len_buf, glib::Priority::DEFAULT)
                         .await
                     {
-                        Ok((len_buf, _, _)) => {
+                        Ok((returned_len_buf, _, _)) => {
+                            len_buf = returned_len_buf;
                             let len = u32::from_le_bytes([
                                 len_buf[0], len_buf[1], len_buf[2], len_buf[3],
                             ]) as usize;
@@ -115,7 +118,7 @@ impl ServoRunner {
         Self {
             frame_sender,
             event_receiver,
-            _subprocess: subprocess,
+            subprocess,
         }
     }
 
@@ -534,5 +537,12 @@ impl ServoRunner {
 impl Drop for ServoRunner {
     fn drop(&mut self) {
         self.shutdown();
+        self.frame_sender.close();
+        let sub = self.subprocess.clone();
+        glib::timeout_add_local_once(Duration::from_millis(300), move || {
+            if sub.identifier().is_some() {
+                sub.force_exit();
+            }
+        });
     }
 }
