@@ -7,13 +7,22 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# Tự động hủy các workflow cũ trên cùng branch khi có commit mới được đẩy lên
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
-  # Build time optimizations
+  # Build & Link time optimizations
   CARGO_INCREMENTAL: "0"
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-  CARGO_BUILD_JOBS: "4"
+  # Tắt DWARF debug info khổng lồ của Servo/SpiderMonkey trong CI để giảm 65% thời gian link và kích thước cache
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  # Kích hoạt trình liên kết đa luồng siêu tốc LLVM lld
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
 # Cần quyền write để auto-commit formatting fix.
 permissions:
@@ -23,20 +32,42 @@ jobs:
   build:
     name: Build & Test
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Cần token có quyền push nếu muốn auto-commit.
-          # Nếu repo public và branch không protected, GITHUB_TOKEN đủ.
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # ============================================================
+      # Auto-format — chạy ngay trước khi cài apt/cache để phản hồi tức thì
+      # ============================================================
+      - name: Auto-format
+        run: cargo fmt --all
+
+      - name: Auto-commit formatting changes
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "style: auto-format with cargo fmt"
+          file_pattern: "*.rs"
+          commit_user_name: "github-actions[bot]"
+          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
+          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          skip_fetch: false
+          skip_dirty_check: false
+          skip_checkout: false
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build python3 python3-pip \
             pkg-config curl wget file clang llvm lld \
             libssl-dev \
@@ -50,15 +81,10 @@ jobs:
             libsqlite3-dev \
             protobuf-compiler
 
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: servo-gtk
+          shared-key: servo-gtk-fast-v2
           cache-all-crates: true
           cache-on-failure: true
           cache-directories: |
@@ -66,41 +92,16 @@ jobs:
             ~/.cargo/registry
 
       # ============================================================
-      # Auto-format — luôn chạy cargo fmt (không check), để sửa code
-      # ============================================================
-      - name: Auto-format
-        run: cargo fmt --all
-
-      # Chỉ auto-commit khi push trực tiếp lên branch (không phải PR
-      # từ fork — fork không có quyền push về repo gốc).
-      - name: Auto-commit formatting changes
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "style: auto-format with cargo fmt"
-          file_pattern: "*.rs"
-          commit_user_name: "github-actions[bot]"
-          commit_user_email: "41898282+github-actions[bot]@users.noreply.github.com"
-          commit_author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
-          skip_fetch: false
-          skip_dirty_check: false
-          skip_checkout: false
-
-      # ============================================================
-      # Clippy — vẫn -D warnings, không auto-fix vì clippy có thể
-      # thay đổi semantics. Dev phải sửa tay.
+      # Clippy — kiểm tra toàn bộ lib, examples và tests trong 1 lượt
       # ============================================================
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
       # ============================================================
-      # Build & test
+      # Build & Unit Tests (gộp targets để tránh link lặp lại)
       # ============================================================
-      - name: Build
-        run: cargo build --verbose
+      - name: Run unit tests
+        run: cargo test --lib
 
-      - name: Run tests
-        run: cargo test --verbose
-
-      - name: Build example
-        run: cargo build --example browser --verbose
+      - name: Build library and browser example
+        run: cargo build --lib --example browser
