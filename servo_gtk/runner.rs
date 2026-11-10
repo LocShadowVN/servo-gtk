@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! Servo runner subprocess entry point — Tối ưu hóa với Double-Buffered `/dev/shm` Shared Memory,
+//! Servo runner subprocess entry point — Tối ưu hóa với 4-Slot `/dev/shm` Shared Memory,
 //! đồng bộ `rendering_context.resize()`, điều tiết 60 FPS và tự động dọn dẹp tài nguyên khi đóng Tab.
 
 use std::cell::{Cell, RefCell};
@@ -173,10 +173,10 @@ impl EventPipe {
     }
 }
 
-/// Bộ đệm khung hình chia sẻ kép (Double-Buffered Shared Memory trên `/dev/shm`)
+/// Bộ đệm khung hình chia sẻ 4-slot xoay vòng trên `/dev/shm` (RAM tmpfs)
 /// giúp truyền 10MB-20MB pixel RGBA mỗi frame mà chỉ tốn ~40 bytes qua pipe IPC.
 struct ShmFrameBuffer {
-    slots: [Option<(PathBuf, File)>; 2],
+    slots: [Option<(PathBuf, File)>; 4],
     next_slot: usize,
 }
 
@@ -186,7 +186,7 @@ impl ShmFrameBuffer {
         let shm_dir = PathBuf::from("/dev/shm");
         if !shm_dir.is_dir() {
             return Self {
-                slots: [None, None],
+                slots: [None, None, None, None],
                 next_slot: 0,
             };
         }
@@ -204,7 +204,7 @@ impl ShmFrameBuffer {
         };
 
         Self {
-            slots: [open_slot(0), open_slot(1)],
+            slots: [open_slot(0), open_slot(1), open_slot(2), open_slot(3)],
             next_slot: 0,
         }
     }
@@ -212,7 +212,7 @@ impl ShmFrameBuffer {
     /// Ghi dữ liệu RGBA vào slot tiếp theo và trả về payload `KSHM:<path>` (chỉ vài chục bytes).
     fn write_frame(&mut self, rgba: &[u8]) -> Option<Vec<u8>> {
         let idx = self.next_slot;
-        self.next_slot = (self.next_slot + 1) % 2;
+        self.next_slot = (self.next_slot + 1) % self.slots.len();
 
         let (path, file) = self.slots[idx].as_mut()?;
         file.set_len(rgba.len() as u64).ok()?;
@@ -229,7 +229,7 @@ impl ShmFrameBuffer {
 
 impl Drop for ShmFrameBuffer {
     fn drop(&mut self) {
-        for slot in self.slots.iter_mut() {
+        for slot in &mut self.slots {
             if let Some((path, _)) = slot.take() {
                 let _ = std::fs::remove_file(path);
             }
@@ -614,8 +614,6 @@ fn spawn_stdin_channel(tx: Sender<RunnerSignal>) {
         loop {
             let mut len_buf = [0u8; 4];
             if stdin.read_exact(&mut len_buf).is_err() {
-                // CRITICAL FIX: Khi tiến trình cha đóng pipe (đóng Tab hoặc tắt trình duyệt),
-                // gửi ngay tín hiệu Shutdown để thoát vòng lặp chính và giải phóng RAM tức thì.
                 let _ = tx.send(RunnerSignal::Action(ServoAction {
                     action: Some(servo_action::Action::Shutdown(true)),
                 }));
@@ -963,7 +961,6 @@ pub fn run() {
                     if new_size != current_size {
                         current_size = new_size;
                         log::debug!("Resizing to {}x{}", new_size.width, new_size.height);
-                        // CRITICAL FIX: Đồng bộ kích thước của cả SoftwareRenderingContext lẫn WebView
                         rendering_context.resize(new_size);
                         webview.resize(new_size);
                         frame_dirty.set(true);
