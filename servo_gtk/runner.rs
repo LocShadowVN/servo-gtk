@@ -2,20 +2,22 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
-//! Servo runner subprocess entry point.
+//! Servo runner subprocess entry point — Tối ưu hóa với Double-Buffered `/dev/shm` Shared Memory,
+//! đồng bộ `rendering_context.resize()`, điều tiết 60 FPS và tự động dọn dẹp tài nguyên khi đóng Tab.
 
 use std::cell::{Cell, RefCell};
-use std::fs::File;
-use std::io::{self, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::BorrowedFd;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use core::time::Duration;
 use dpi::PhysicalSize;
 use embedder_traits::{ContextMenuItem, WebViewPoint, WebViewVector};
 use euclid::{Point2D, Scale};
@@ -49,6 +51,7 @@ use crate::proto_ipc::{
 };
 
 pub(crate) const SCRIPT_MESSAGE_PREFIX: &str = "__servo_gtk_msg__";
+pub(crate) const SHM_FRAME_PREFIX: &[u8] = b"KSHM:";
 
 pub const RUNNER_ARG: &str = "--servo-gtk-runner";
 
@@ -170,6 +173,70 @@ impl EventPipe {
     }
 }
 
+/// Bộ đệm khung hình chia sẻ kép (Double-Buffered Shared Memory trên `/dev/shm`)
+/// giúp truyền 10MB-20MB pixel RGBA mỗi frame mà chỉ tốn ~40 bytes qua pipe IPC.
+struct ShmFrameBuffer {
+    slots: [Option<(PathBuf, File)>; 2],
+    next_slot: usize,
+}
+
+impl ShmFrameBuffer {
+    fn new() -> Self {
+        let pid = std::process::id();
+        let shm_dir = PathBuf::from("/dev/shm");
+        if !shm_dir.is_dir() {
+            return Self {
+                slots: [None, None],
+                next_slot: 0,
+            };
+        }
+
+        let open_slot = |idx: usize| -> Option<(PathBuf, File)> {
+            let path = shm_dir.join(format!("kestrel-frame-{pid}-{idx}.raw"));
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .ok()?;
+            Some((path, file))
+        };
+
+        Self {
+            slots: [open_slot(0), open_slot(1)],
+            next_slot: 0,
+        }
+    }
+
+    /// Ghi dữ liệu RGBA vào slot tiếp theo và trả về payload `KSHM:<path>` (chỉ vài chục bytes).
+    fn write_frame(&mut self, rgba: &[u8]) -> Option<Vec<u8>> {
+        let idx = self.next_slot;
+        self.next_slot = (self.next_slot + 1) % 2;
+
+        let (path, file) = self.slots[idx].as_mut()?;
+        file.set_len(rgba.len() as u64).ok()?;
+        file.seek(SeekFrom::Start(0)).ok()?;
+        file.write_all(rgba).ok()?;
+
+        let path_str = path.to_str()?;
+        let mut marker = Vec::with_capacity(SHM_FRAME_PREFIX.len() + path_str.len());
+        marker.extend_from_slice(SHM_FRAME_PREFIX);
+        marker.extend_from_slice(path_str.as_bytes());
+        Some(marker)
+    }
+}
+
+impl Drop for ShmFrameBuffer {
+    fn drop(&mut self) {
+        for slot in self.slots.iter_mut() {
+            if let Some((path, _)) = slot.take() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 struct ServoWebViewDelegate {
     rendering_context: Rc<dyn RenderingContext>,
     event_pipe: EventPipe,
@@ -236,7 +303,6 @@ impl WebViewDelegate for ServoWebViewDelegate {
         }
 
         let dest_debug = format!("{:?}", load.request.destination);
-        // Any non-main-frame Document/Frame/Iframe load is a subdocument (iframe).
         let resource_type = if matches!(dest_debug.as_str(), "Document" | "Frame" | "Iframe") {
             "subdocument"
         } else {
@@ -548,12 +614,20 @@ fn spawn_stdin_channel(tx: Sender<RunnerSignal>) {
         loop {
             let mut len_buf = [0u8; 4];
             if stdin.read_exact(&mut len_buf).is_err() {
+                // CRITICAL FIX: Khi tiến trình cha đóng pipe (đóng Tab hoặc tắt trình duyệt),
+                // gửi ngay tín hiệu Shutdown để thoát vòng lặp chính và giải phóng RAM tức thì.
+                let _ = tx.send(RunnerSignal::Action(ServoAction {
+                    action: Some(servo_action::Action::Shutdown(true)),
+                }));
                 break;
             }
             let len = u32::from_le_bytes(len_buf) as usize;
 
             let mut msg_buf = vec![0u8; len];
             if stdin.read_exact(&mut msg_buf).is_err() {
+                let _ = tx.send(RunnerSignal::Action(ServoAction {
+                    action: Some(servo_action::Action::Shutdown(true)),
+                }));
                 break;
             }
 
@@ -656,7 +730,8 @@ fn complete_file_picker(mut picker: FilePicker, answer: crate::proto_ipc::FileCh
 
 fn html_to_data_url(html: &str) -> String {
     const UNRESERVED: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~";
-    let mut out = String::from("data:text/html;charset=utf-8,");
+    let mut out = String::with_capacity(32 + html.len() * 2);
+    out.push_str("data:text/html;charset=utf-8,");
     for &byte in html.as_bytes() {
         if UNRESERVED.contains(&byte) {
             out.push(byte as char);
@@ -740,7 +815,8 @@ fn push_coalesced_input(pending: &mut Vec<servo_action::Action>, action: ServoAc
 }
 
 pub fn run() {
-    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(30);
+    const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+    const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(15);
 
     let (event_logger, log_receiver) = EventLogger::new();
 
@@ -751,9 +827,9 @@ pub fn run() {
 
     log::info!("Starting servo runner");
 
-    let mut current_size = PhysicalSize::new(800, 600);
+    let mut current_size = PhysicalSize::new(1280, 800);
     let mut current_scale: f32 = 1.0;
-    let mut last_mouse_pos = Point2D::new(400.0, 300.0);
+    let mut last_mouse_pos = Point2D::new(640.0, 400.0);
 
     let rendering_context = Rc::new(
         SoftwareRenderingContext::new(current_size)
@@ -801,6 +877,10 @@ pub fn run() {
     let adblock = Rc::new(RefCell::new(AdblockState::new()));
     let current_page_url = Rc::new(RefCell::new(None));
     let frame_dirty = Rc::new(Cell::new(false));
+    let mut shm_buffer = ShmFrameBuffer::new();
+    let mut last_paint_time = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
 
     let delegate = Rc::new(ServoWebViewDelegate::new(
         rendering_context.clone(),
@@ -883,6 +963,8 @@ pub fn run() {
                     if new_size != current_size {
                         current_size = new_size;
                         log::debug!("Resizing to {}x{}", new_size.width, new_size.height);
+                        // CRITICAL FIX: Đồng bộ kích thước của cả SoftwareRenderingContext lẫn WebView
+                        rendering_context.resize(new_size);
                         webview.resize(new_size);
                         frame_dirty.set(true);
                     }
@@ -1172,8 +1254,11 @@ pub fn run() {
 
         servo.spin_event_loop();
 
-        // Coalesced frame paint & readback: at most once per event loop tick.
-        if frame_dirty.replace(false) {
+        // Coalesced frame paint & readback: điều tiết tối đa ~60 FPS và truyền qua `/dev/shm`
+        if frame_dirty.get() && last_paint_time.elapsed() >= MIN_FRAME_INTERVAL {
+            frame_dirty.set(false);
+            last_paint_time = Instant::now();
+
             let size = rendering_context.size2d().to_i32();
             let viewport_rect = DeviceIntRect::from_origin_and_size(Point2D::origin(), size);
             webview.paint();
@@ -1182,16 +1267,20 @@ pub fn run() {
             if let Some(rgba_image) = rendering_context.read_to_image(viewport_rect) {
                 let width = rgba_image.width();
                 let height = rgba_image.height();
-                let data = rgba_image.into_raw();
+                let raw_bytes = rgba_image.into_raw();
+
+                let payload = shm_buffer.write_frame(&raw_bytes).unwrap_or(raw_bytes);
 
                 let event = ServoEvent {
                     event: Some(servo_event::Event::FrameReady(FrameReady {
-                        rgba_data: data,
+                        rgba_data: payload,
                         width,
                         height,
                     })),
                 };
-                let _ = event_pipe.send(event);
+                if event_pipe.send(event).is_err() {
+                    break 'event_loop;
+                }
             }
         }
 
