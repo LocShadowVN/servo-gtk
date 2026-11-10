@@ -1,4 +1,4 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
+* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
@@ -7,6 +7,7 @@ use crate::proto_ipc::{
     AuthRequest, ContextMenuRequest, FileChooserRequest, PermissionRequest, ScriptDialogKind,
     ScriptDialogRequest, ServoEvent, servo_event,
 };
+use crate::runner::SHM_FRAME_PREFIX;
 use crate::servo_runner::{LogLevel, ServoRunner};
 use crate::user_content::UserContentManager;
 use glib::info;
@@ -267,9 +268,10 @@ mod imp {
         }
 
         fn dispose(&self) {
-            if let Some(servo) = self.servo_runner.borrow().as_ref() {
+            if let Some(servo) = self.servo_runner.borrow_mut().take() {
                 servo.shutdown();
             }
+            self.memory_texture.replace(None);
         }
     }
 
@@ -508,10 +510,10 @@ impl WebView {
         }
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
 
         let label = gtk::Label::new(Some(message));
         label.set_wrap(true);
@@ -567,10 +569,10 @@ impl WebView {
         }
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
 
         let label = gtk::Label::new(Some(message));
         label.set_wrap(true);
@@ -681,10 +683,10 @@ impl WebView {
         }
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        content.set_margin_top(12);
-        content.set_margin_bottom(12);
-        content.set_margin_start(12);
-        content.set_margin_end(12);
+        content.set_margin_top(14);
+        content.set_margin_bottom(14);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
 
         let kind = if request.for_proxy { "proxy" } else { "server" };
         let label = gtk::Label::new(Some(&format!(
@@ -797,7 +799,8 @@ impl WebView {
         );
         popover.set_pointing_to(Some(&rect));
 
-        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu_box.add_css_class("kestrel-menu");
         popover.set_child(Some(&menu_box));
 
         let responded = Rc::new(Cell::new(false));
@@ -820,7 +823,9 @@ impl WebView {
 
         for (index, entry) in request.items.iter().enumerate() {
             if entry.separator {
-                menu_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+                let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                sep.add_css_class("kestrel-menu-separator");
+                menu_box.append(&sep);
                 continue;
             }
             let button = gtk::Button::builder()
@@ -828,6 +833,7 @@ impl WebView {
                 .sensitive(entry.enabled)
                 .has_frame(false)
                 .build();
+            button.add_css_class("kestrel-menu-item");
             let respond_item = respond.clone();
             button.connect_clicked(move |_| respond_item(true, index as u32));
             menu_box.append(&button);
@@ -856,11 +862,32 @@ impl WebView {
                 let expected_len = (width as usize)
                     .saturating_mul(height as usize)
                     .saturating_mul(4);
-                if width == 0 || height == 0 || frame_ready.rgba_data.len() != expected_len {
+                if width == 0 || height == 0 || expected_len == 0 {
                     return;
                 }
 
-                let bytes = glib::Bytes::from_owned(frame_ready.rgba_data);
+                // Kiểm tra xem payload có phải là đường dẫn `/dev/shm` (`KSHM:<path>`) không.
+                // Nếu đúng, ánh xạ trực tiếp qua `glib::MappedFile` (Zero-Copy `mmap`).
+                let bytes = if let Some(path_bytes) =
+                    frame_ready.rgba_data.strip_prefix(SHM_FRAME_PREFIX)
+                {
+                    let Ok(shm_path) = std::str::from_utf8(path_bytes) else {
+                        return;
+                    };
+                    let Ok(mapped) = glib::MappedFile::new(shm_path, false) else {
+                        return;
+                    };
+                    if mapped.len() != expected_len {
+                        return;
+                    }
+                    mapped.into_bytes()
+                } else {
+                    if frame_ready.rgba_data.len() != expected_len {
+                        return;
+                    }
+                    glib::Bytes::from_owned(frame_ready.rgba_data)
+                };
+
                 let texture = gdk::MemoryTexture::new(
                     width as i32,
                     height as i32,
