@@ -83,33 +83,27 @@ impl ServoRunner {
             stdout,
             async move {
                 let mut len_buf = vec![0u8; 4];
-                loop {
-                    match stdout
-                        .read_all_future(len_buf, glib::Priority::DEFAULT)
-                        .await
-                    {
-                        Ok((returned_len_buf, _, _)) => {
-                            len_buf = returned_len_buf;
-                            let len = u32::from_le_bytes([
-                                len_buf[0], len_buf[1], len_buf[2], len_buf[3],
-                            ]) as usize;
+                while let Ok((returned_len_buf, _, _)) = stdout
+                    .read_all_future(len_buf, glib::Priority::DEFAULT)
+                    .await
+                {
+                    len_buf = returned_len_buf;
+                    let len =
+                        u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]])
+                            as usize;
 
-                            let msg_buf = vec![0u8; len];
-                            match stdout
-                                .read_all_future(msg_buf, glib::Priority::DEFAULT)
-                                .await
-                            {
-                                Ok((msg_buf, _, _)) => {
-                                    if let Ok(event) = ServoEvent::decode_from_slice(&msg_buf)
-                                        && event_sender.send(event).await.is_err()
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        Err(_) => break,
+                    let msg_buf = vec![0u8; len];
+                    let Ok((msg_buf, _, _)) = stdout
+                        .read_all_future(msg_buf, glib::Priority::DEFAULT)
+                        .await
+                    else {
+                        break;
+                    };
+
+                    if let Ok(event) = ServoEvent::decode_from_slice(&msg_buf)
+                        && event_sender.send(event).await.is_err()
+                    {
+                        break;
                     }
                 }
             }
